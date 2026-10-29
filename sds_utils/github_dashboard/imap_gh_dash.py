@@ -1,6 +1,6 @@
 """Dashboard of issues, PRs, and Actions across IMAP SDC repos (NiceGUI + PyGithub).
 
-Read-only, except for the manual workflow triggers in DISPATCHABLE.
+Read-only, except for the workflow dispatches in WORKFLOWS (dry runs only, for now).
 Auth: $GITHUB_TOKEN, falling back to `gh auth token`.
 """
 
@@ -10,11 +10,14 @@ import html
 import os
 import re
 import subprocess
+import sys
 import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
+from itertools import islice
 
+import requests
 from github import Auth, Github, GithubException
 from nicegui import run, ui
 
@@ -218,18 +221,6 @@ def run_rows(repo: str, result: dict) -> list[dict]:
         }
         for r in result["runs"]
     ]
-
-
-# ------------------------------------------------------------ manual triggers
-# Workflows the dashboard may dispatch. Each must have a `workflow_dispatch` trigger
-# and exist on `ref`. These are the dashboard's only write calls.
-DISPATCHABLE = {  # label -> (repo, workflow file, ref)
-    "Say hello": ("leowerneck/example-action", "hello.yml", "main"),
-}
-
-
-def dispatch(repo: str, workflow: str, ref: str) -> None:
-    GH.get_repo(repo).get_workflow(workflow).create_dispatch(ref, throw=True)
 
 
 # ---------------------------------------------------------- deployment status
@@ -517,6 +508,60 @@ def render_status(status: dict) -> str:
     )
 
 
+# ------------------------------------------------------------------ workflows
+# The dashboard's only write calls. Dry runs dispatch the copies in .github/workflows
+# of this repo, which take the same inputs as the real workflows but only print.
+DRY_RUN_REPO = "leowerneck/sds-utils"
+WORKFLOWS = {  # key -> (dry-run workflow in DRY_RUN_REPO, real repo, real workflow)
+    "dev": ("dry-run-build_and_deploy_l0-l2_dev_containers.yml", SDM, "deploy_dev_containers.yml"),
+    "dev_l3": ("dry-run-build_and_deploy_l3_dev_containers.yml", L3_REPO, "deploy_container.yml"),
+    "promote": ("dry-run-promote_containers_dev_to_prod.yml", SDM, "promote_containers_dev_to_prod.yml"),
+    "infra": ("dry-run-deploy_infrastructure.yml", SDM, "deploy.yml"),
+}
+PIPELINE = {  # (action, level) -> (workflow key, instrument choices, inputs for an instrument)
+    ("Deploy to Dev", "L0–L2"): ("dev", ["all", *INSTRUMENTS], lambda i: {"instruments": i}),
+    ("Deploy to Dev", "L3"): ("dev_l3", ["all", *L3_INSTRUMENTS], lambda i: {"instrument_name": i}),
+    ("Promote to Prod", "L0–L2"): ("promote", ["all", *INSTRUMENTS], lambda i: {"instruments": i, "l3_data": "false"}),
+    ("Promote to Prod", "L3"): ("promote", ["all", *L3_INSTRUMENTS], lambda i: {"instruments": i, "l3_data": "true"}),
+}
+STEP_ICONS = {"success": "✅", "failure": "❌", "running": "⏳", None: "⚪"}
+
+
+def target(key: str, dry_run: bool) -> tuple[str, str, str]:
+    """(repo, workflow file, ref) that `key` dispatches."""
+    dry_workflow, repo, workflow = WORKFLOWS[key]
+    if not dry_run:  # real dispatches are not enabled yet
+        raise NotImplementedError("Only dry runs are supported for now")
+    return (DRY_RUN_REPO, dry_workflow, "main") if dry_run else (f"{ORG}/{repo}", workflow, REPOS[repo])
+
+
+def dispatch(key: str, inputs: dict, dry_run: bool):
+    repo, workflow, ref = target(key, dry_run)
+    return GH.get_repo(repo).get_workflow(workflow).create_dispatch(
+        ref, inputs, throw=True, return_run_details=True)
+
+
+def recent_runs(keys: list[str], dry_run: bool) -> list:
+    runs = []
+    for key in set(keys):
+        repo, workflow, _ = target(key, dry_run)
+        runs += islice(GH.get_repo(repo).get_workflow(workflow).get_runs(), 10)  # [:10] fails on short lists
+    return sorted(runs, key=lambda r: r.created_at, reverse=True)[:10]
+
+
+def run_status(run) -> tuple:
+    """Refresh `run` in place; return it, its jobs, and (once completed) each job's log."""
+    run.update()
+    jobs = list(run.jobs())
+    logs = {}
+    if run.status == "completed":
+        for job in jobs:
+            text = requests.get(job.logs_url(), timeout=30).text
+            text = re.sub(r"^\S+Z |\x1b\[[0-9;]*m", "", text, flags=re.M)  # drop timestamps and colors
+            logs[job.name] = re.sub(r"##\[group\].*?##\[endgroup\]\n", "", text, flags=re.S)  # and setup noise
+    return run, jobs, logs
+
+
 # ------------------------------------------------------------------------- UI
 THEMES = {"Light": False, "Auto": None, "Dark": True}  # Auto follows the OS
 FONT = '<link href="https://fonts.googleapis.com/css2?family=Source+Sans+3:wght@400;600;700&display=swap" rel="stylesheet">'
@@ -526,6 +571,7 @@ body { font-family: "Source Sans 3", sans-serif !important; }
 .body--dark .q-drawer { background: #262730; }
 .q-tab-panel { padding: 1rem 0; }
 .warn { padding: 0.75rem 1rem; border-radius: 0.5rem; background: rgba(255, 189, 69, .2); }
+.q-btn-toggle .q-btn { font-weight: 600; }
 """
 # Flatter, denser Quasar widgets without the default ALL CAPS
 ui.button.default_props("no-caps unelevated text-color=black")  # black reads better on orange
@@ -556,13 +602,29 @@ def metric(label: str, value: int) -> None:
         ui.label(str(value)).classes("text-4xl")
 
 
-@ui.page("/")
-async def index():
+WORKFLOW_PAGES = {"/pipeline": "Pipeline Containers", "/infrastructure": "Infrastructure Containers"}
+
+
+def page_setup() -> ui.dark_mode:
     ui.add_head_html(FONT)
     ui.add_css(STATUS_CSS + APP_CSS)
     ui.colors(primary="#ff8f00", dark="#0e1117", dark_page="#0e1117")
-    dark = ui.dark_mode(THEMES["Auto"])
     ui.query(".nicegui-content").classes("px-12 py-8")
+    return ui.dark_mode(THEMES["Auto"])
+
+
+def sidebar_end(dark: ui.dark_mode) -> None:
+    """Workflow page buttons and theme toggle, at the bottom of every page's sidebar."""
+    ui.label("Deployment Workflows").classes("text-xl font-bold mt-4")
+    for path, label in WORKFLOW_PAGES.items():
+        ui.button(label, on_click=lambda p=path: ui.navigate.to(p)).classes("w-full font-semibold").style("white-space: pre-line")
+    ui.label("Theme").classes("font-semibold mt-4")
+    ui.toggle(list(THEMES), value="Auto", on_change=lambda e: dark.set_value(THEMES[e.value]))
+
+
+@ui.page("/")
+async def index():
+    dark = page_setup()
 
     def matches(row: dict) -> bool:
         people = row["author"] + " " + row["assignees"]
@@ -620,13 +682,6 @@ async def index():
         await load_status()
         await load_tables()
 
-    async def trigger(repo: str, workflow: str, ref: str):
-        try:
-            await run.io_bound(dispatch, repo, workflow, ref)
-            ui.notify(f"Dispatched {workflow} on {repo}", type="positive")
-        except GithubException as exc:
-            ui.notify(f"Dispatch failed: {exc}", type="negative", multi_line=True)
-
     with ui.left_drawer().classes("gap-3 p-4"):
         repos = ui.select(list(REPOS), value=list(REPOS), multiple=True, label="Repositories",
                           on_change=load_tables).classes("w-full")
@@ -635,16 +690,11 @@ async def index():
             ui.input(label, value="", on_change=load_tables).props("debounce=300").classes("w-full")
             for label in ("Label contains", "Author / assignee contains", "Title contains")
         )
-        ui.button("Refresh", icon="refresh", on_click=refresh).classes("w-full")
-        ui.label("Trigger workflows").classes("font-semibold mt-4")
-        for label, (repo, workflow, ref) in DISPATCHABLE.items():
-            ui.button(label, icon="play_arrow", on_click=lambda a=(repo, workflow, ref): trigger(*a)).classes("w-full")
-            ui.link("View runs", f"https://github.com/{repo}/actions/workflows/{workflow}", new_tab=True)
-        ui.label("Theme").classes("font-semibold mt-4")
-        ui.toggle(list(THEMES), value="Auto", on_change=lambda e: dark.set_value(THEMES[e.value]))
+        ui.button("Refresh", icon="refresh", on_click=refresh).classes("w-full font-semibold")
+        sidebar_end(dark)
 
     ui.label("IMAP SDC GitHub Dashboard").classes("text-4xl font-bold")
-    ui.label("Read-only, except for the workflow buttons in the sidebar. "
+    ui.label("Read-only, except for the workflow pages in the sidebar. "
              "Data from GitHub, cached for 5 minutes (deployment status: 2 minutes).").classes("text-sm opacity-60")
     status_box = ui.column().classes("w-full")
     summary = ui.row().classes("w-full")
@@ -658,10 +708,133 @@ async def index():
     await asyncio.gather(load_status(), load_tables())
 
 
+async def workflow_page(path: str, keys: list[str], form) -> None:
+    """Layout shared by the workflow pages: inputs, Run Action, live run monitor, recent runs.
+
+    `form(on_change)` adds the input widgets and returns a function giving
+    (workflow key, inputs) once every input is chosen, else None.
+    """
+    dark = page_setup()
+    with ui.left_drawer().classes("gap-3 p-4"):
+        ui.button("Home", icon="home", on_click=lambda: ui.navigate.to("/")).classes("w-full")
+        sidebar_end(dark)
+
+    async def start():
+        key, inputs = choice()
+        try:
+            new_run = await run.io_bound(dispatch, key, inputs, dry_run.value)
+        except GithubException as exc:
+            ui.notify(f"Dispatch failed: {exc}", type="negative", multi_line=True)
+            return
+        ui.notify("Dispatched", type="positive")
+        await asyncio.gather(watch(new_run), load_recent())
+
+    async def watch(wf_run):
+        nonlocal watched
+        watched = wf_run
+        timer.activate()
+        await poll()
+
+    async def poll():
+        wf_run, jobs, logs = await run.io_bound(run_status, watched)
+        monitor.refresh(wf_run, jobs, logs)
+        if wf_run.status == "completed":
+            timer.deactivate()
+            await load_recent()
+
+    @ui.refreshable
+    def monitor(wf_run=None, jobs=(), logs=None):
+        if wf_run is None:
+            return
+        with ui.card().props("flat bordered").classes("w-full"):
+            with ui.row().classes("w-full items-center"):
+                ui.label(f"{STEP_ICONS[outcome(wf_run)]} {wf_run.display_title}").classes("text-lg font-semibold")
+                ui.label(wf_run.conclusion or wf_run.status).classes("opacity-60")
+                ui.space()
+                ui.button("View on GitHub", icon="open_in_new",
+                          on_click=lambda: ui.navigate.to(wf_run.html_url, new_tab=True))
+            for job in jobs:
+                ui.label(f"{STEP_ICONS[outcome(job)]} {job.name}").classes("font-semibold")
+                for step in job.steps:
+                    ui.label(f"{STEP_ICONS[outcome(step)]} {step.name}").classes("ml-6 text-sm")
+                if logs and job.name in logs:
+                    with ui.expansion("Log", value=True).classes("w-full"):
+                        ui.code(logs[job.name], language="text").classes("w-full")
+
+    async def load_recent():
+        runs = await run.io_bound(recent_runs, keys, dry_run.value)
+        recent_box.clear()
+        with recent_box, ui.list().props("dense bordered separator").classes("w-full"):
+            for r in runs:
+                ui.item(f"{STEP_ICONS[outcome(r)]} {r.display_title} · {_time(r.created_at)}",
+                        on_click=lambda r=r: watch(r))
+
+    ui.label(WORKFLOW_PAGES[path].replace("\n", " ")).classes("text-4xl font-bold")
+    ui.label(f"Dry runs dispatch the [Dry Run] copies of these workflows in {DRY_RUN_REPO}; "
+             "they only print what a real run would do.").classes("text-sm opacity-60")
+    with ui.row().classes("items-center gap-4"):
+        choice = form(lambda: run_button.set_enabled(choice() is not None))
+    with ui.row().classes("items-center gap-4"):
+        dry_run = ui.checkbox("dry-run", value=True).props("disable")  # real runs not supported yet
+        run_button = ui.button("Run Action", icon="play_arrow", on_click=start)
+        run_button.disable()
+    watched = None
+    timer = ui.timer(3, poll, active=False)
+    monitor()
+    ui.label("Recent runs (click to monitor)").classes("text-xl font-semibold mt-4")
+    recent_box = ui.column().classes("w-full")
+
+    await ui.context.client.connected()
+    await load_recent()
+
+
+@ui.page("/pipeline")
+async def pipeline_page():
+    def form(on_change):
+        def update():
+            _, choices, _ = PIPELINE.get((action.value, level.value), (None, [], None))
+            instrument.set_options({i: PRETTY_NAMES.get(i, "All") for i in choices},
+                                   value=instrument.value if instrument.value in choices else None)
+            on_change()
+
+        action = ui.select(list(dict.fromkeys(a for a, _ in PIPELINE)), label="Action", on_change=update)
+        level = ui.select(["L0–L2", "L3"], label="Data Level", on_change=update)
+        instrument = ui.select({}, label="Instrument", on_change=on_change)
+        for box in (action, level, instrument):
+            box.classes("min-w-48")
+
+        def choice():
+            if instrument.value is None:
+                return None
+            key, _, inputs = PIPELINE[(action.value, level.value)]
+            return key, inputs(instrument.value)
+        return choice
+
+    await workflow_page("/pipeline", ["dev", "dev_l3", "promote"], form)
+
+
+@ui.page("/infrastructure")
+async def infrastructure_page():
+    def form(on_change):
+        env = ui.select(["Development", "Production"], label="Environment", on_change=on_change).classes("min-w-48")
+        skips = [ui.checkbox(f"Skip {stack}", value=True).bind_visibility_from(env, "value", value="prod")
+                 for stack in ("IalirtStack", "IalirtSsrStack")]
+
+        def choice():
+            if env.value is None:
+                return None
+            skip_ialirt, skip_ialirt_ssr = (str(box.value).lower() for box in skips)
+            return "infra", {"environment": env.value, "skip_ialirt": skip_ialirt, "skip_ialirt_ssr": skip_ialirt_ssr}
+        return choice
+
+    await workflow_page("/infrastructure", ["infra"], form)
+
+
 def main():
     """Entrypoint for the IMAP GitHub Dashboard."""
-    # localhost only: the app acts with your GitHub token
-    ui.run(title="IMAP GitHub Dashboard", host="127.0.0.1", port=8765, reload=False)  # 8080 is often taken
+    # localhost only: the app acts with your GitHub token. `--reload` restarts on source edits.
+    ui.run(title="IMAP GitHub Dashboard", host="127.0.0.1", port=8765,  # 8080 is often taken
+           reload="--reload" in sys.argv, uvicorn_reload_dirs=os.path.dirname(__file__))
 
 
 if __name__ in {"__main__", "__mp_main__"}:
