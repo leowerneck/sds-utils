@@ -35,6 +35,11 @@ STATE_FILTERS = {  # UI choice -> (issue states, PR states)
     "Merged": ([], ["MERGED"]),
     "All": (["OPEN", "CLOSED"], ["OPEN", "CLOSED", "MERGED"]),
 }
+TYPE_ORDER = ["Bug", "Task", "Feature"]  # initial table order within each repo; other/no type last
+TYPE_COLORS = {  # GitHub's issue type colors (text on a light background)
+    "RED": "#d1242f", "BLUE": "#0969da", "YELLOW": "#9a6700", "GREEN": "#1a7f37",
+    "ORANGE": "#bc4c00", "PURPLE": "#8250df", "PINK": "#bf3989", "GRAY": "#59636e",
+}
 CI_ICONS = {"SUCCESS": "✅", "FAILURE": "❌", "ERROR": "❌", "PENDING": "⏳", "EXPECTED": "⏳"}
 
 
@@ -81,6 +86,7 @@ def _states(states: list[str]) -> str:
 
 ISSUE_FIELDS = """
   number title url state updatedAt
+  issueType { name color }
   author { login }
   assignees(first: 5) { nodes { login } }
   labels(first: 10) { nodes { name } }
@@ -94,7 +100,7 @@ PR_FIELDS = """
   assignees(first: 5) { nodes { login } }
   labels(first: 10) { nodes { name } }
   milestone { title }
-  closingIssuesReferences(first: 5) { nodes { number } }
+  closingIssuesReferences(first: 5) { nodes { url } }
   commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }
 """
 PROJECT_FIELDS = """
@@ -139,7 +145,7 @@ def fetch_repo(repo: str, base: str, state: str) -> dict:
         pdata = graphql(_query(PROJECT_FIELDS, PROJECT_FIELDS, issue_states, pr_states), **variables)
         for kind in ("issues", "pullRequests"):
             for node in (pdata.get(kind) or {}).get("nodes", []):
-                projects[(kind, node["number"])] = ", ".join(
+                projects[(kind, node["number"])] = "\n".join(
                     f"{i['project']['title']}: {(i['fieldValueByName'] or {}).get('name', '-')}"
                     for i in node["projectItems"]["nodes"]
                 )
@@ -151,24 +157,51 @@ def fetch_repo(repo: str, base: str, state: str) -> dict:
 
 
 # ----------------------------------------------------------------- flattening
+# Multi-value cells hold one value per line (the table CSS renders the newlines)
 def _names(conn: dict, key: str = "name") -> str:
-    return ", ".join(n[key] for n in conn["nodes"])
+    return "\n".join(n[key] for n in conn["nodes"])
 
 
 def _nums(conn: dict) -> str:
-    return ", ".join(f"#{n['number']}" for n in conn["nodes"])
+    return "\n".join(f"#{n['number']}" for n in conn["nodes"])
+
+
+def type_rank(row: dict) -> int:
+    """Sort key putting issues in TYPE_ORDER; rows without a type (PRs, runs) all tie."""
+    return TYPE_ORDER.index(row["type"]) if row.get("type") in TYPE_ORDER else len(TYPE_ORDER)
 
 
 def _time(value: str | datetime) -> str:
     return (value if isinstance(value, datetime) else datetime.fromisoformat(value)).strftime("%Y-%m-%d %H:%M")
 
 
+def _ci(pr: dict) -> str:
+    """Icon for the combined CI state of a PR's latest commit."""
+    commit = pr["commits"]["nodes"][0]["commit"] if pr["commits"]["nodes"] else {}
+    ci = (commit.get("statusCheckRollup") or {}).get("state", "")
+    return CI_ICONS.get(ci, ci)
+
+
+def _pr_status(pr: dict) -> str:
+    """Closed / Merged, or for open PRs: Draft, else the review state (Open if no review is required)."""
+    if pr["state"] != "OPEN":
+        return pr["state"].title()
+    if pr["isDraft"]:
+        return "Draft"
+    return (pr["reviewDecision"] or "Open").replace("_", " ").title()  # e.g. REVIEW_REQUIRED -> Review Required
+
+
 def _common(repo: str, node: dict, projects: dict, kind: str, projects_ok: bool) -> dict:
+    issue_type = node.get("issueType") or {}
     return {
-        "repo": repo,
+        "repository": repo,
         "link": node["url"],
+        **({"type": issue_type.get("name", ""), "_type_color": TYPE_COLORS.get(issue_type.get("color"))}
+           if kind == "issues" else {}),  # PRs have no type
+        **({"closes": [i["url"] for i in node["closingIssuesReferences"]["nodes"]], "CI": _ci(node)}
+           if kind == "pullRequests" else {}),
         "title": node["title"],
-        "state": node["state"],
+        "status": node["state"],
         "author": (node["author"] or {}).get("login", "ghost"),
         "assignees": _names(node["assignees"], "login"),
         "labels": _names(node["labels"]),
@@ -184,7 +217,7 @@ def issue_rows(repo: str, result: dict) -> list[dict]:
     for n in (result["data"].get("issues") or {}).get("nodes", []):
         row = _common(repo, n, result["projects"], "issues", ok)
         row["linked PRs"] = _nums(n["closedByPullRequestsReferences"])
-        row["linked branches"] = ", ".join(b["ref"]["name"] for b in n["linkedBranches"]["nodes"] if b["ref"])
+        row["linked branches"] = "\n".join(b["ref"]["name"] for b in n["linkedBranches"]["nodes"] if b["ref"])
         rows.append(row)
     return rows
 
@@ -194,14 +227,9 @@ def pr_rows(repo: str, result: dict) -> list[dict]:
     rows = []
     for n in result["data"]["pullRequests"]["nodes"]:
         row = _common(repo, n, result["projects"], "pullRequests", ok)
-        commit = n["commits"]["nodes"][0]["commit"] if n["commits"]["nodes"] else {}
-        ci = (commit.get("statusCheckRollup") or {}).get("state", "")
         row.update({
-            "draft": n["isDraft"],
+            "status": _pr_status(n),
             "branches": f"{n['baseRefName']} ← {n['headRefName']}",
-            "review": n["reviewDecision"] or "",
-            "CI": CI_ICONS.get(ci, ci),
-            "closes": _nums(n["closingIssuesReferences"]),
         })
         rows.append(row)
     return rows
@@ -210,7 +238,7 @@ def pr_rows(repo: str, result: dict) -> list[dict]:
 def run_rows(repo: str, result: dict) -> list[dict]:
     return [
         {
-            "repo": repo,
+            "repository": repo,
             "link": r.html_url,
             "workflow": r.name,
             "title": r.display_title,
@@ -569,20 +597,26 @@ APP_CSS = """
 body { font-family: "Source Sans 3", sans-serif !important; }
 .q-drawer { background: #f0f2f6; }
 .body--dark .q-drawer { background: #262730; }
-.q-tab-panel { padding: 1rem 0; }
 .warn { padding: 0.75rem 1rem; border-radius: 0.5rem; background: rgba(255, 189, 69, .2); }
-.q-btn-toggle .q-btn { font-weight: 600; }
+.q-btn { font-weight: 600; }
+.q-table th { font-weight: 700; }
+.q-table--no-wrap .q-table td { white-space: pre; }  /* never wrap, but show newlines: one value per line */
 """
 # Flatter, denser Quasar widgets without the default ALL CAPS
 ui.button.default_props("no-caps unelevated text-color=black")  # black reads better on orange
 ui.toggle.default_props("no-caps unelevated toggle-text-color=black")
-ui.tabs.default_props("no-caps dense align=left active-color=primary indicator-color=primary")
 ui.input.default_props("outlined dense")
 ui.select.default_props("outlined dense")
 ui.table.default_props("flat bordered dense separator=cell")
 
 LINK_CELL = ('<q-td :props="props"><a :href="props.value" target="_blank" class="text-primary">'
              '#{{ props.value.split("/").pop() }}</a></q-td>')
+CLOSES_CELL = ('<q-td :props="props"><div v-for="url in props.value"><a :href="url" target="_blank" '
+               'class="text-primary">#{{ url.split("/").pop() }}</a></div></q-td>')  # one link per line
+TYPE_CELL = '<q-td :props="props" :style="{color: props.row._type_color}" class="text-weight-bold">{{ props.value }}</q-td>'
+COLUMN_STYLES = {  # column -> inline CSS for its cells (the table otherwise never wraps)
+    "title": "min-width: 16rem; max-width: 32rem; white-space: normal",
+}
 
 
 def show(rows: list[dict]) -> None:
@@ -590,10 +624,13 @@ def show(rows: list[dict]) -> None:
         ui.label("Nothing to show.")
         return
     ui.label(f"{len(rows)} rows (at most {LIMIT} per repo)").classes("text-sm opacity-60")
-    columns = [{"name": k, "label": "#" if k == "link" else k, "field": k, "sortable": True, "align": "left"}
-               for k in rows[0]]
-    table = ui.table(rows=rows, columns=columns, row_key="link", pagination=25).classes("w-full")
+    columns = [{"name": k, "label": "No." if k == "link" else k[0].upper() + k[1:], "field": k, "sortable": True,
+                "align": "left", "style": COLUMN_STYLES.get(k, "")}
+               for k in rows[0] if not k.startswith("_")]  # _keys are for slots, not columns
+    table = ui.table(rows=rows, columns=columns, row_key="link", pagination=100).classes("w-full")
     table.add_slot("body-cell-link", LINK_CELL)
+    table.add_slot("body-cell-type", TYPE_CELL)
+    table.add_slot("body-cell-closes", CLOSES_CELL)
 
 
 def metric(label: str, value: int) -> None:
@@ -602,34 +639,53 @@ def metric(label: str, value: int) -> None:
         ui.label(str(value)).classes("text-4xl")
 
 
+LIST_PAGES = {  # path -> (title, row function, state choices, filter on the text boxes)
+    "/issues": ("Issues", issue_rows, ["Open", "Closed", "All"], True),
+    "/pulls": ("Pull Requests", pr_rows, list(STATE_FILTERS), True),
+    "/actions": ("Actions", run_rows, [], False),
+}
 WORKFLOW_PAGES = {"/pipeline": "Pipeline Containers", "/infrastructure": "Infrastructure Containers"}
+SIDEBAR = {  # section -> {path: button label}
+    "Development": {path: page[0] for path, page in LIST_PAGES.items()},
+    "Deployment Workflows": WORKFLOW_PAGES,
+}
+TEXT_FILTERS = {  # text box label -> the row text it searches
+    "Label contains": lambda row: row["labels"],
+    "Author / assignee contains": lambda row: row["author"] + " " + row["assignees"],
+    "Title contains": lambda row: row["title"],
+}
 
 
-def page_setup() -> ui.dark_mode:
+def refresh() -> None:
+    """Pick up a new token, drop cached data, and reload the page."""
+    global GH
+    GH = connect()
+    fetch_repo.cache.clear()
+    fetch_status.cache.clear()
+    ui.navigate.reload()
+
+
+def page_setup() -> None:
+    """Styling and sidebar shared by every page."""
     ui.add_head_html(FONT)
     ui.add_css(STATUS_CSS + APP_CSS)
     ui.colors(primary="#ff8f00", dark="#0e1117", dark_page="#0e1117")
     ui.query(".nicegui-content").classes("px-12 py-8")
-    return ui.dark_mode(THEMES["Auto"])
-
-
-def sidebar_end(dark: ui.dark_mode) -> None:
-    """Workflow page buttons and theme toggle, at the bottom of every page's sidebar."""
-    ui.label("Deployment Workflows").classes("text-xl font-bold mt-4")
-    for path, label in WORKFLOW_PAGES.items():
-        ui.button(label, on_click=lambda p=path: ui.navigate.to(p)).classes("w-full font-semibold").style("white-space: pre-line")
-    ui.label("Theme").classes("font-semibold mt-4")
-    ui.toggle(list(THEMES), value="Auto", on_change=lambda e: dark.set_value(THEMES[e.value]))
+    dark = ui.dark_mode(THEMES["Auto"])
+    with ui.left_drawer().classes("gap-3 p-4"):
+        ui.button("Home", icon="home", on_click=lambda: ui.navigate.to("/")).classes("w-full")
+        ui.button("Refresh", icon="refresh", on_click=refresh).classes("w-full")
+        for section, pages in SIDEBAR.items():
+            ui.label(section).classes("text-xl font-bold mt-4")
+            for path, label in pages.items():
+                ui.button(label, on_click=lambda p=path: ui.navigate.to(p)).classes("w-full")
+        ui.label("Theme").classes("font-semibold mt-4")
+        ui.toggle(list(THEMES), value="Auto", on_change=lambda e: dark.set_value(THEMES[e.value]))
 
 
 @ui.page("/")
 async def index():
-    dark = page_setup()
-
-    def matches(row: dict) -> bool:
-        people = row["author"] + " " + row["assignees"]
-        return all(box.value.lower() in text.lower()
-                   for box, text in ((label_box, row["labels"]), (people_box, people), (title_box, row["title"])))
+    page_setup()
 
     async def load_status():
         status_box.clear()
@@ -643,15 +699,9 @@ async def index():
         with status_box:
             ui.html(content, sanitize=False).classes("w-full")
 
-    async def load_tables():
-        names = repos.value
-        if not names:
-            summary.clear()
-            with summary:
-                ui.label("Select at least one repository.")
-            return
-        fetches = (run.io_bound(fetch_repo, r, REPOS[r], state.value) for r in names)
-        results = dict(zip(names, await asyncio.gather(*fetches)))
+    async def load_summary():
+        fetches = (run.io_bound(fetch_repo, repo, base, "Open") for repo, base in REPOS.items())
+        results = dict(zip(REPOS, await asyncio.gather(*fetches)))
         summary.clear()
         with summary:
             for repo, res in results.items():
@@ -662,50 +712,81 @@ async def index():
                         metric(f"Open PRs → {REPOS[repo]}", res["data"]["openPRs"]["totalCount"])
                         metric("Drafts (shown)", sum(p["isDraft"] for p in res["data"]["pullRequests"]["nodes"]))
                         metric("Failed runs (last 20)", sum(r.conclusion == "failure" for r in res["runs"]))
-            if any(res["projects_error"] for res in results.values()):
-                ui.label("Projects are unavailable (token likely missing the `read:project` scope). "
-                         "Grant read-only access with `gh auth refresh -s read:project` "
-                         "(or put a token with that scope in $GITHUB_TOKEN and restart), then click Refresh."
-                         ).classes("warn w-full")
-        for panel, row_fn, filtered in ((issues_panel, issue_rows, True), (prs_panel, pr_rows, True),
-                                        (runs_panel, run_rows, False)):
-            rows = [row for r, res in results.items() for row in row_fn(r, res)]
-            panel.clear()
-            with panel:
-                show([row for row in rows if matches(row)] if filtered else rows)
-
-    async def refresh():
-        global GH
-        GH = connect()
-        fetch_repo.cache.clear()
-        fetch_status.cache.clear()
-        await load_status()
-        await load_tables()
-
-    with ui.left_drawer().classes("gap-3 p-4"):
-        repos = ui.select(list(REPOS), value=list(REPOS), multiple=True, label="Repositories",
-                          on_change=load_tables).classes("w-full")
-        state = ui.toggle(list(STATE_FILTERS), value="Open", on_change=load_tables)
-        label_box, people_box, title_box = (
-            ui.input(label, value="", on_change=load_tables).props("debounce=300").classes("w-full")
-            for label in ("Label contains", "Author / assignee contains", "Title contains")
-        )
-        ui.button("Refresh", icon="refresh", on_click=refresh).classes("w-full font-semibold")
-        sidebar_end(dark)
 
     ui.label("IMAP SDC GitHub Dashboard").classes("text-4xl font-bold")
     ui.label("Read-only, except for the workflow pages in the sidebar. "
              "Data from GitHub, cached for 5 minutes (deployment status: 2 minutes).").classes("text-sm opacity-60")
     status_box = ui.column().classes("w-full")
     summary = ui.row().classes("w-full")
-    with ui.tabs() as tabs:
-        for name in ("Issues", "Pull requests", "Actions"):
-            ui.tab(name)
-    with ui.tab_panels(tabs, value="Issues").classes("w-full"):
-        issues_panel, prs_panel, runs_panel = (ui.tab_panel(name) for name in ("Issues", "Pull requests", "Actions"))
 
     await ui.context.client.connected()
-    await asyncio.gather(load_status(), load_tables())
+    await asyncio.gather(load_status(), load_summary())
+
+
+async def list_page(path: str) -> None:
+    """Issues, pull requests, or Actions runs across the selected repos, as one table."""
+    title, row_fn, states, filtered = LIST_PAGES[path]
+    page_setup()
+    latest = None  # the newest load; older ones that finish later are dropped
+
+    def matches(row: dict) -> bool:
+        return all(box.value.lower() in text(row).lower() for box, text in zip(boxes, TEXT_FILTERS.values()))
+
+    async def load():
+        nonlocal latest
+        latest = this = object()
+        loading.props("showing")
+        names = [r for r in REPOS if r in repo_tree.props["ticked"]]
+        repo_box.value = "All" if len(names) == len(REPOS) else ", ".join(names) or "None"
+        fetches = (run.io_bound(fetch_repo, r, REPOS[r], state.value if states else "Open") for r in names)
+        results = dict(zip(names, await asyncio.gather(*fetches)))
+        if this is not latest:
+            return
+        table_box.clear()
+        with table_box:
+            if filtered and any(res["projects_error"] for res in results.values()):
+                ui.label("Projects are unavailable (token likely missing the `read:project` scope). "
+                         "Grant read-only access with `gh auth refresh -s read:project` "
+                         "(or put a token with that scope in $GITHUB_TOKEN and restart), then click Refresh."
+                         ).classes("warn w-full")
+            show([row for r, res in results.items() for row in sorted(row_fn(r, res), key=type_rank) if matches(row)])
+        loading.props(remove="showing")
+
+    ui.label(title).classes("text-4xl font-bold")
+    ui.label("Data from GitHub, cached for 5 minutes.").classes("text-sm opacity-60")
+    with ui.row().classes("w-full items-center gap-4"):
+        repo_box = ui.input("Repositories").props("readonly").classes("min-w-64")  # opens the checkbox tree
+        with repo_box.add_slot("append"):
+            ui.icon("arrow_drop_down")
+        with repo_box, ui.menu().props("fit"):
+            repo_tree = ui.tree([{"id": "All", "children": [{"id": r} for r in REPOS]}], label_key="id",
+                                tick_strategy="leaf", on_tick=load).expand().tick()
+        if states:
+            state = ui.toggle(states, value=states[0], on_change=load)
+        boxes = [ui.input(label, value="", on_change=load).props("debounce=300").classes("min-w-48")
+                 for label in TEXT_FILTERS] if filtered else []
+    with ui.element("div").classes("w-full relative min-h-48"):  # the overlay dims the table while loading
+        table_box = ui.column().classes("w-full")
+        with ui.element("q-inner-loading") as loading:
+            ui.spinner(size="3em")
+
+    await ui.context.client.connected()
+    await load()
+
+
+@ui.page("/issues")
+async def issues_page():
+    await list_page("/issues")
+
+
+@ui.page("/pulls")
+async def pulls_page():
+    await list_page("/pulls")
+
+
+@ui.page("/actions")
+async def actions_page():
+    await list_page("/actions")
 
 
 async def workflow_page(path: str, keys: list[str], form) -> None:
@@ -714,10 +795,7 @@ async def workflow_page(path: str, keys: list[str], form) -> None:
     `form(on_change)` adds the input widgets and returns a function giving
     (workflow key, inputs) once every input is chosen, else None.
     """
-    dark = page_setup()
-    with ui.left_drawer().classes("gap-3 p-4"):
-        ui.button("Home", icon="home", on_click=lambda: ui.navigate.to("/")).classes("w-full")
-        sidebar_end(dark)
+    page_setup()
 
     async def start():
         key, inputs = choice()
@@ -816,7 +894,8 @@ async def pipeline_page():
 @ui.page("/infrastructure")
 async def infrastructure_page():
     def form(on_change):
-        env = ui.select(["Development", "Production"], label="Environment", on_change=on_change).classes("min-w-48")
+        env = ui.select({"dev": "Development", "prod": "Production"}, label="Environment",
+                        on_change=on_change).classes("min-w-48")
         skips = [ui.checkbox(f"Skip {stack}", value=True).bind_visibility_from(env, "value", value="prod")
                  for stack in ("IalirtStack", "IalirtSsrStack")]
 
