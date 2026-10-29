@@ -660,7 +660,8 @@ async def index():
 
 def main():
     """Entrypoint for the IMAP GitHub Dashboard."""
-    ui.run(title="IMAP GitHub Dashboard", port=8765, reload=False)  # 8080 is often taken
+    # localhost only: the app acts with your GitHub token
+    ui.run(title="IMAP GitHub Dashboard", host="127.0.0.1", port=8765, reload=False)  # 8080 is often taken
 
 
 if __name__ in {"__main__", "__mp_main__"}:
