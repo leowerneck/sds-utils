@@ -591,7 +591,7 @@ def run_status(run) -> tuple:
 
 
 # ------------------------------------------------------------------------- UI
-THEMES = {"Light": False, "Auto": None, "Dark": True}  # Auto follows the OS
+theme = {"dark": True}  # kept across pages (and browser tabs): this is a single-user, localhost app
 FONT = '<link href="https://fonts.googleapis.com/css2?family=Source+Sans+3:wght@400;600;700&display=swap" rel="stylesheet">'
 APP_CSS = """
 body { font-family: "Source Sans 3", sans-serif !important; }
@@ -644,10 +644,10 @@ LIST_PAGES = {  # path -> (title, row function, state choices, filter on the tex
     "/pulls": ("Pull Requests", pr_rows, list(STATE_FILTERS), True),
     "/actions": ("Actions", run_rows, [], False),
 }
-WORKFLOW_PAGES = {"/pipeline": "Pipeline Containers", "/infrastructure": "Infrastructure Containers"}
+WORKFLOW_PAGES = {"/infrastructure": "Infrastructure", "/pipeline": "Data Pipeline"}
 SIDEBAR = {  # section -> {path: button label}
     "Development": {path: page[0] for path, page in LIST_PAGES.items()},
-    "Deployment Workflows": WORKFLOW_PAGES,
+    "Deployment": WORKFLOW_PAGES,
 }
 TEXT_FILTERS = {  # text box label -> the row text it searches
     "Label contains": lambda row: row["labels"],
@@ -671,16 +671,26 @@ def page_setup() -> None:
     ui.add_css(STATUS_CSS + APP_CSS)
     ui.colors(primary="#ff8f00", dark="#0e1117", dark_page="#0e1117")
     ui.query(".nicegui-content").classes("px-12 py-8")
-    dark = ui.dark_mode(THEMES["Auto"])
-    with ui.left_drawer().classes("gap-3 p-4"):
-        ui.button("Home", icon="home", on_click=lambda: ui.navigate.to("/")).classes("w-full")
-        ui.button("Refresh", icon="refresh", on_click=refresh).classes("w-full")
+    theme_button()
+    with ui.left_drawer().props(":width=160").classes("gap-3 p-4"):
+        with ui.row().classes("w-full no-wrap gap-3"):
+            ui.button(icon="home", on_click=lambda: ui.navigate.to("/")).classes("flex-1").tooltip("Home")
+            ui.button(icon="refresh", on_click=refresh).classes("flex-1").tooltip("Refresh")
         for section, pages in SIDEBAR.items():
             ui.label(section).classes("text-xl font-bold mt-4")
             for path, label in pages.items():
                 ui.button(label, on_click=lambda p=path: ui.navigate.to(p)).classes("w-full")
-        ui.label("Theme").classes("font-semibold mt-4")
-        ui.toggle(list(THEMES), value="Auto", on_change=lambda e: dark.set_value(THEMES[e.value]))
+
+
+def theme_button() -> None:
+    """Light/dark toggle in the page's top-right corner."""
+    dark = ui.dark_mode(theme["dark"])
+
+    def toggle() -> None:
+        theme["dark"] = not theme["dark"]
+        dark.set_value(theme["dark"])
+
+    ui.button(icon="contrast", on_click=toggle).props("flat round text-color=primary").classes("absolute top-4 right-6")
 
 
 @ui.page("/")
